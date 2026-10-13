@@ -273,6 +273,22 @@ def patch_0005_agent_main():
             'container.module.symbol ("frida_agent_main"',
             'container.module.symbol ("main"',
             n)
+    # —— 定义侧（最容易漏，漏了必炸）——
+    # 15.2.2 的 agent 入口在 agent.vala 第 2 行写作
+    #     namespace Frida.Agent { public void main (...) }
+    # C 符号 frida_agent_main 是 valac 按「namespace 前缀 + 方法名」拼出来的，
+    # 源码里根本没有这个字面量，grep 不到。改调用方/导出脚本而不改这里，
+    # 链接阶段就是 ld: error: undefined symbol: main。
+    # 用 [CCode (cname = ...)] 覆盖 valac 生成的 C 函数名。
+    sub_all("lib/agent/agent.vala",
+            "\tpublic void main (string agent_parameters,",
+            '\t[CCode (cname = "main")]\n'
+            "\tpublic void main (string agent_parameters,",
+            n)
+    # darwin 分支专用（Android 走不到，但保持一致，避免以后编 macOS 时漏）
+    sub_all("lib/agent/meson.build",
+            "-Wl,-exported_symbol,_frida_agent_main",
+            "-Wl,-exported_symbol,_main", n)
 
 
 # ------------------------------------------------------------------ 0006
