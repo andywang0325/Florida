@@ -1,117 +1,156 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把 Florida 那套为 frida-core 15.x 写的补丁，重新锚定到 17.23.3 的源码上。
+把 Florida / strongR 那套反检测替换，重新锚定到 frida 15.2.2 源码上。
 
-背景
-----
-上游 patches/ 里的 .patch 是 2021 年为 frida-core 15.x 生成的，git am 依赖
-行号上下文。到 17.23.3 上下文已经漂了，第一个补丁就会 CONFLICT，
-而 `set -e` 会让整个 job 直接失败 —— 白等一小时。
+为什么不用 git am
+-----------------
+上游 .patch 是 2021 年为 frida-core 15.x 生成的，git am 依赖行号上下文；
+直接套到 15.2.2 会在第一个补丁就 CONFLICT，`set -e` 让整条 CI 白等。
+这里改为「子串替换 + 代码插入」，与行号无关，且幂等。
 
-做法
-----
-不做 git am，改为在源码文本上做「子串/正则替换 + 插入」，因此与行号无关，
-且幂等（重复执行会打印 SKIP 而不是重复插入）。
+为什么保留协议兼容
+-----------------
+frida:rpc 不走简单改名 —— 主机端用的是官方 frida 15.2.2 客户端，
+它发的就是 "frida:rpc"。所以改成「运行时双层 Base64 解码」，
+逻辑等价（解出来仍是 frida:rpc），只是二进制里不再有明文。
 
 用法
 ----
-    python3 port_patches_to_17233.py <frida 源码根目录>
+    python3 tools/port_patches_to_1522.py <frida 超级仓库根>
 
-返回码恒为 0：让 CI 继续 configure / make，不会因为某个补丁缺失而整条链路报废。
-每步打印 [OK] / [SKIP] / [FAIL] / [NA]，最后输出摘要。
+返回码恒为 0：某一步没命中也让它继续 configure / make，最后打印摘要。
+每步强制统计命中次数 —— 命中 0 一律打 [FAIL]（17.x 那次 0002 静默假阳性的教训）。
 """
 import os
 import re
 import sys
 
+PREFIX = "ggbond"
+
 ROOT = None   # frida-core 子项目根
 GUM = None    # frida-gum 子项目根
+TOP = None    # frida 超级仓库根（Makefile.linux.mk 在这一层）
 RESULT = []
+
+CORE_MARKER = os.path.join("lib", "base", "rpc.vala")
+GUM_MARKER = os.path.join("gum", "gum.c")
 
 
 def resolve_roots(argument):
-    """参数既可以是 frida 超级仓库根，也可以直接是 frida-core 根 —— 自动识别，
-    避免把 ROOT 写错导致「全部 FAIL 却静默产出原版」这种坑。"""
+    """参数既可以是 frida 超级仓库根，也可以直接是 frida-core 根。
+
+    坑（2026-10 首次跑 CI 就是栽在这）：frida 的目录布局改过 ——
+        15.x : <super>/frida-core           <super>/frida-gum          （顶层）
+        16+  : <super>/subprojects/frida-core   .../subprojects/frida-gum
+    只认 subprojects/ 的话，15.2.2 上会全部退化成 NA 且静默不报错。
+    所以两种布局都要探测，并把超级仓库根一起返回。
+    """
+    arg = os.path.abspath(argument)
+
     core = None
-    for cand in [argument, os.path.join(argument, "subprojects", "frida-core")]:
-        if os.path.isfile(os.path.join(cand, "lib", "base", "rpc.vala")):
+    for cand in [os.path.join(arg, "subprojects", "frida-core"),
+                 os.path.join(arg, "frida-core"),
+                 arg]:
+        if os.path.isfile(os.path.join(cand, CORE_MARKER)):
             core = cand
             break
     if core is None:
-        core = argument
-    gum = os.path.join(os.path.dirname(os.path.abspath(core)), "frida-gum")
-    if not os.path.isfile(os.path.join(gum, "gum", "gum.c")):
-        gum = None
-    return core, gum
+        core = arg
+
+    gum = None
+    for cand in [os.path.join(os.path.dirname(core), "frida-gum"),
+                 os.path.join(arg, "subprojects", "frida-gum"),
+                 os.path.join(arg, "frida-gum")]:
+        if os.path.isfile(os.path.join(cand, GUM_MARKER)):
+            gum = cand
+            break
+
+    if os.path.isdir(os.path.join(arg, "frida-core")) or \
+       os.path.isdir(os.path.join(arg, "subprojects")):
+        top = arg
+    else:
+        top = os.path.dirname(core)
+    return core, gum, top
 
 
 def log(tag, name, detail=""):
     RESULT.append((tag, name, detail))
-    line = f"[{tag}] {name}"
+    line = "[%s] %s" % (tag, name)
     if detail:
-        line += f" -- {detail}"
+        line += " -- " + detail
     print(line, flush=True)
 
 
-def read(rel):
-    with open(os.path.join(ROOT, rel), "r", encoding="utf-8", newline="") as f:
+def read(rel, root=None):
+    with open(os.path.join(root or ROOT, rel), "r", encoding="utf-8", newline="") as f:
         return f.read()
 
 
-def write(rel, text):
-    with open(os.path.join(ROOT, rel), "w", encoding="utf-8", newline="") as f:
+def write(rel, text, root=None):
+    with open(os.path.join(root or ROOT, rel), "w", encoding="utf-8", newline="") as f:
         f.write(text)
 
 
-def exists(rel):
-    return os.path.isfile(os.path.join(ROOT, rel))
+def exists(rel, root=None):
+    return os.path.isfile(os.path.join(root or ROOT, rel))
 
 
-def sub_once(rel, old, new, name):
-    """只替换第一次出现；已替换过就跳过（幂等）。"""
-    if not exists(rel):
-        log("NA", name, f"文件不存在，17.x 可能已移除: {rel}")
+def sub_all(rel, old, new, name, expect=1, root=None):
+    """全量替换并强制核对命中次数。命中 0 == FAIL，绝不静默通过。"""
+    base = root or ROOT
+    if not exists(rel, base):
+        log("NA", name, "文件不存在: %s" % rel)
         return False
-    text = read(rel)
-    if new in text:
-        log("SKIP", name, "已应用")
-        return True
-    if old not in text:
-        log("FAIL", name, f"找不到锚点: {old!r}")
+    text = read(rel, base)
+    hits = text.count(old)
+    if hits == 0:
+        if new in text:
+            log("SKIP", name, "已应用")
+            return True
+        log("FAIL", name, "锚点未命中: %r (%s)" % (old, rel))
         return False
-    write(rel, text.replace(old, new, 1))
-    log("OK", name, rel)
+    write(rel, text.replace(old, new), base)
+    if hits < expect:
+        log("WARN", name, "只命中 %d 处，预期 %d 处 (%s)" % (hits, expect, rel))
+    else:
+        log("OK", name, "%s x%d" % (rel, hits))
     return True
 
 
 # ------------------------------------------------------------------ 0001
-# string_frida_rpc：把明文 "frida:rpc" 换成运行时 Base64 解码出来的串
-def patch_0001():
+def patch_0001_rpc():
+    """frida:rpc -> 运行时解码，保持与官方客户端协议兼容。"""
     rel = "lib/base/rpc.vala"
     name = "0001 string_frida_rpc"
     if not exists(rel):
-        log("NA", name, f"文件不存在: {rel}")
+        log("NA", name, "文件不存在: %s" % rel)
         return
     text = read(rel)
 
     if "getRpcStr" not in text:
-        ctor = "\t\tpublic RpcClient (RpcPeer peer) {\n\t\t\tObject (peer: peer);\n\t\t}\n"
-        method = (
-            "\t\tpublic string getRpcStr(bool quote){\n"
-            '\t\t\tstring result = (string) GLib.Base64.decode((string) GLib.Base64.decode("Wm5KcFpHRTZjbkJq"));\n'
-            "\t\t\tif(quote){\n"
-            '\t\t\t\treturn "\\"" + result + "\\"";\n'
-            "\t\t\t}else{\n"
-            "\t\t\t\treturn result;\n"
-            "\t\t\t}\n"
-            "\t\t}\n"
-        )
-        if ctor not in text:
-            log("FAIL", name, "找不到 RpcClient 构造函数锚点")
+        # 15.2.2 里 RpcClient 在 namespace + class 内，缩进是两个 tab；
+        # 用正则自适应，避免照搬 17.x 的单 tab 锚点导致静默不命中。
+        pat = re.compile(
+            r"\n([ \t]*)public RpcClient \(RpcPeer peer\) \{\n"
+            r"[ \t]*Object \(peer: peer\);\n[ \t]*\}\n")
+        m = pat.search(text)
+        if m is None:
+            log("FAIL", name, "找不到 RpcClient 构造函数作为插入点")
             return
-        text = text.replace(ctor, ctor + "\n" + method, 1)
-        print("[OK] 0001 string_frida_rpc -- 插入 getRpcStr()", flush=True)
+        ind = m.group(1)
+        method = (
+            ind + "public string getRpcStr(bool quote){\n"
+            + ind + "\tstring result = (string) GLib.Base64.decode((string) GLib.Base64.decode(\"Wm5KcFpHRTZjbkJq\"));\n"
+            + ind + "\tif(quote){\n"
+            + ind + "\t\treturn \"\\\"\" + result + \"\\\"\";\n"
+            + ind + "\t}else{\n"
+            + ind + "\t\treturn result;\n"
+            + ind + "\t}\n"
+            + ind + "}\n"
+        )
+        text = text[:m.end()] + "\n" + method + text[m.end():]
+        print("[OK] %s -- 插入 getRpcStr() (缩进 %r)" % (name, ind), flush=True)
     else:
         log("SKIP", name, "getRpcStr 已存在")
 
@@ -120,291 +159,240 @@ def patch_0001():
         ('json.index_of ("\\"frida:rpc\\"")', "json.index_of (getRpcStr(true))"),
         ('type != "frida:rpc"', "type != getRpcStr(false)"),
     ]
-    changed = False
+    hits = 0
     for old, new in pairs:
         if new in text:
+            hits += 1
             continue
         if old in text:
             text = text.replace(old, new, 1)
-            changed = True
-    if changed:
-        write(rel, text)
-        print("[OK] 0001 string_frida_rpc -- 替换 frida:rpc 三处", flush=True)
+            hits += 1
+    write(rel, text)
+    if hits == 3:
+        log("OK", name, "三处 frida:rpc 已替换")
+    else:
+        log("FAIL", name, "只替换了 %d/3 处 frida:rpc" % hits)
 
 
 # ------------------------------------------------------------------ 0002
-# frida_agent_so：agent 落地文件名加随机前缀
-def patch_0002():
+def patch_0002_default_dir():
+    """/data/local/tmp/re.frida.server 是最经典的一条检测项。"""
+    sub_all("server/server.vala",
+            'DEFAULT_DIRECTORY = "re.frida.server"',
+            'DEFAULT_DIRECTORY = "%s-cache"' % PREFIX,
+            "0002 io_re_frida_server")
+
+
+# ------------------------------------------------------------------ 0003
+def patch_0003_linjector():
+    sub_all("src/linux/frida-helper-backend-glue.c",
+            '"%s/linjector-%u"',
+            '"%%s/%s-inject-%%u"' % PREFIX,
+            "0003 pipe_linjector")
+
+
+# ------------------------------------------------------------------ 0004
+def patch_0004_agent_name():
+    """agent 落到目标进程 tempdir 时的文件名 —— maps 扫描的头号目标。
+
+    采用 Florida 的做法：**运行时随机 UUID**，而不是在 meson 层把 agent 改名。
+    为什么不能在 meson 层改名（15.2.2 上的三个连环坑）：
+      1. shared_library('frida-agent') 一改，vala 生成的头文件就跟着变成
+         <新名>.h，而 lib/agent/agent-glue.c 里写死 #include "frida-agent.h"；
+      2. lib/agent/meson.build 引用同名的 frida-agent.def / frida-agent.version，
+         只改文本、不重命名磁盘文件，meson 直接报「文件不存在」；
+      3. Makefile.linux.mk 里 -Dagent_modern=.../lib/agent/frida-agent.so 是硬编码的。
+    随机化只动「运行时文件名」，构建链路一个字都不用碰，风险最小。
+    """
+    n = "0004 agent_runtime_name"
     rel = "src/linux/linux-host-session.vala"
-    name = "0002 frida_agent_so"
     if not exists(rel):
-        log("NA", name, f"文件不存在: {rel}")
+        log("NA", n, "文件不存在: %s" % rel)
         return
+
     text = read(rel)
     if "random_prefix" in text:
-        log("SKIP", name, "已应用")
-        return
-
-    m = re.search(r'\n([ \t]*)([A-Za-z_][\w.]*)\s*=\s*new AgentDescriptor \(PathTemplate \("frida-agent-<arch>\.so"\),', text)
-    if not m:
-        log("FAIL", name, "找不到 AgentDescriptor 锚点")
-        return
-    ind, var = m.group(1), m.group(2)
-    new = (
-        f"\n{ind}var random_prefix = GLib.Uuid.string_random();\n"
-        f'{ind}{var} = new AgentDescriptor (PathTemplate (random_prefix + "-<arch>.so"),'
-    )
-    text = text[:m.start()] + new + text[m.end():]
-
-    n1 = text.count('new AgentResource ("frida-agent-arm.so"')
-    n2 = text.count('new AgentResource ("frida-agent-arm64.so"')
-    text = text.replace('new AgentResource ("frida-agent-arm.so"', 'new AgentResource (random_prefix + "-arm.so"')
-    text = text.replace('new AgentResource ("frida-agent-arm64.so"', 'new AgentResource (random_prefix + "-arm64.so"')
-    write(rel, text)
-    log("OK", name, f"{rel} (AgentResource 改名 {n1}+{n2} 处)")
-
-
-# ------------------------------------------------------------------ 0003 + 0004 + 0005 + 0007
-# symbol_frida_agent_main：agent 入口符号改名；并把 lief 洗符号脚本一次性写成最终版
-# （上游是 0003 建文件、0004/0005 追加线程名、0007 整体重写，这里合并成一步，避免级联冲突）
-ANTI_ANTI = '''import lief
-import sys
-import random
-import os
-
-def log_color(msg):
-    print(f"\\033[1;31;40m{msg}\\033[0m")
-
-if __name__ == "__main__":
-    input_file = sys.argv[1]
-    random_charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    log_color(f"[*] Patch frida-agent: {input_file}")
-    binary = lief.parse(input_file)
-
-    if not binary:
-        log_color(f"[*] Not elf, exit")
-        exit()
-
-    random_name = "".join(random.sample(random_charset, 5))
-    log_color(f"[*] Patch `frida` to `{random_name}`")
-
-    for symbol in binary.symbols:
-        if symbol.name == "frida_agent_main":
-            symbol.name = "main"
-
-        if "frida" in symbol.name:
-            symbol.name = symbol.name.replace("frida", random_name)
-
-        if "FRIDA" in symbol.name:
-            symbol.name = symbol.name.replace("FRIDA", random_name)
-
-    # 字符串特征修改：等长反转，避免破坏偏移
-    all_patch_string = ["FridaScriptEngine", "GLib-GIO", "GDBusProxy", "GumScript"]
-    for section in binary.sections:
-        if section.name != ".rodata":
-            continue
-        for patch_str in all_patch_string:
-            addr_all = section.search_all(patch_str)
-            for addr in addr_all:
-                patch = [ord(n) for n in list(patch_str)[::-1]]
-                log_color(f"[*] Patching section name={section.name} offset={hex(section.file_offset + addr)} orig:{patch_str} new:{''.join(list(patch_str)[::-1])}")
-                binary.patch_address(section.file_offset + addr, patch)
-
-    binary.write(input_file)
-
-    # 线程名随机化
-    random_name = "".join(random.sample(random_charset, 11))
-    log_color(f"[*] Patch `gum-js-loop` to `{random_name}`")
-    os.system(f"sed -b -i s/gum-js-loop/{random_name}/g {input_file}")
-
-    random_name = "".join(random.sample(random_charset, 5))
-    log_color(f"[*] Patch `gmain` to `{random_name}`")
-    os.system(f"sed -b -i s/gmain/{random_name}/g {input_file}")
-
-    random_name = "".join(random.sample(random_charset, 5))
-    log_color(f"[*] Patch `gdbus` to `{random_name}`")
-    os.system(f"sed -b -i s/gdbus/{random_name}/g {input_file}")
-
-    log_color(f"[*] Patch Finish")
-'''
-
-HOST_SESSIONS = [
-    "src/agent-container.vala",
-    "src/darwin/darwin-host-session.vala",
-    "src/freebsd/freebsd-host-session.vala",
-    "src/linux/linux-host-session.vala",
-    "src/qnx/qnx-host-session.vala",
-    "src/windows/windows-host-session.vala",
-]
-TESTS = ["tests/test-agent.vala", "tests/test-injector.vala"]
-
-
-def patch_0003():
-    # 先落脚本文件（内容一致时判定为 SKIP，保证幂等）
-    target = os.path.join(ROOT, "src", "anti-anti-frida.py")
-    try:
-        same = os.path.isfile(target) and read("src/anti-anti-frida.py") == ANTI_ANTI
-    except Exception:
-        same = False
-    if same:
-        log("SKIP", "0003/0004/0005/0007 anti-anti-frida.py", "已是最终版")
+        log("SKIP", n, "已应用")
     else:
-        with open(target, "w", encoding="utf-8", newline="\n") as f:
-            f.write(ANTI_ANTI)
-        log("OK", "0003/0004/0005/0007 anti-anti-frida.py", "写入最终版洗符号脚本")
+        pat = re.compile(
+            r'(\n([ \t]*)agent = new AgentDescriptor \(PathTemplate \("frida-agent-<arch>\.so"\),)')
+        m = pat.search(text)
+        if m is None:
+            log("FAIL", n, "找不到 AgentDescriptor 锚点: %s" % rel)
+            return
+        ind = m.group(2)
+        head = text[:m.start(1)]
+        tail = text[m.end(1):]
+        text = (head
+                # 用裸 Uuid.string_random ()：15.2.2 自身在 rpc.vala / session.vala
+                # 里就是这么用的，绑定一定存在。
+                + "\n" + ind + "var random_prefix = Uuid.string_random ();\n"
+                + ind + 'agent = new AgentDescriptor (PathTemplate (random_prefix + "-<arch>.so"),'
+                + tail)
+        for old, new in [
+            ('new AgentResource ("frida-agent-arm.so"',
+             'new AgentResource (random_prefix + "-arm.so"'),
+            ('new AgentResource ("frida-agent-arm64.so"',
+             'new AgentResource (random_prefix + "-arm64.so"'),
+        ]:
+            if old not in text:
+                log("FAIL", n, "锚点未命中: %r" % old)
+                return
+            text = text.replace(old, new, 1)
+        write(rel, text)
+        log("OK", n, "%s 运行时名改为随机 UUID" % rel)
 
-    for rel in HOST_SESSIONS + TESTS:
-        if not exists(rel):
-            log("NA", f"0003 {rel}", "文件不存在，跳过")
-            continue
-        text = read(rel)
-        if "frida_agent_main" not in text:
-            log("SKIP", f"0003 {rel}", "无 frida_agent_main")
-            continue
-        write(rel, text.replace("frida_agent_main", "main"))
-        log("OK", f"0003 {rel}", "入口符号改名 frida_agent_main -> main")
+    # agent 自己拼 emulated agent 路径时那个 "frida-agent-arm64.so" 字面量，
+    # 会随 agent .so 一起被加载进目标进程，顺手去掉：改由自身文件名推导。
+    rel2 = "lib/agent/agent.vala"
+    if not exists(rel2):
+        log("NA", n, "文件不存在: %s" % rel2)
+        return
+    t2 = read(rel2)
+    old2 = 'sizeof (void *) == 8 ? "frida-agent-arm64.so" : "frida-agent-arm.so"'
+    if old2 in t2:
+        new2 = ('Path.get_basename (agent_path)'
+                '\n\t\t\t\t\t.replace ("-64.so", "-arm64.so")'
+                '\n\t\t\t\t\t.replace ("-32.so", "-arm.so")')
+        write(rel2, t2.replace(old2, new2, 1))
+        log("OK", n, "%s 去掉 frida-agent 字面量" % rel2)
+    elif "frida-agent-arm64" not in t2:
+        log("SKIP", n, "agent.vala 已处理")
+    else:
+        log("FAIL", n, "agent.vala 锚点未命中")
+
+
+# ------------------------------------------------------------------ 0005
+def patch_0005_agent_main():
+    n = "0005 symbol_frida_agent_main"
+    for rel in ["lib/agent/agent-glue.c",
+                "lib/agent/frida-agent.version",
+                "lib/agent/frida-agent.def"]:
+        sub_all(rel, "frida_agent_main", "main", n, expect=1)
+    sub_all("src/agent-container.vala",
+            'container.module.symbol ("frida_agent_main"',
+            'container.module.symbol ("main"',
+            n)
 
 
 # ------------------------------------------------------------------ 0006
-# protocol_unexpected_command：droidy 客户端在 17.23.3 已不存在，无需移植
-def patch_0006():
-    rel = "src/droidy/droidy-client.vala"
-    if not exists(rel):
-        log("NA", "0006 protocol_unexpected_command",
-            "src/droidy/droidy-client.vala 在 17.23.3 已删除（droidy 只剩 axml/host-session/injector/jdwp），该特征随之消失，无需移植")
-        return
-    sub_once(rel,
-             'throw new Error.PROTOCOL ("Unexpected command");',
-             'break; // throw new Error.PROTOCOL ("Unexpected command");',
-             "0006 protocol_unexpected_command")
-
-
-# ------------------------------------------------------------------ 0008
-# pool-frida：改进程名（影响 /proc/self/comm、ps 输出）
-def patch_0008():
-    rel = "src/frida-glue.c"
-    name = "0008 pool-frida (prgname)"
-    if not exists(rel):
-        log("NA", name, f"文件不存在: {rel}")
-        return
-    text = read(rel)
-    if "g_set_prgname" in text:
-        log("SKIP", name, "已应用")
-        return
-    # 必须插在 gum_init() 之后 —— 因为 frida-gum 的 gum_init_embedded() 里
-    # 自己会 g_set_prgname("frida")，插太早会被它盖掉（gum 那处另行处理）。
-    m = re.search(r"\n([ \t]*)(if \(runtime == FRIDA_RUNTIME_OTHER\))", text)
-    if not m:
-        log("FAIL", name, "找不到 `if (runtime == FRIDA_RUNTIME_OTHER)` 锚点")
-        return
-    ind = m.group(1)
-    text = text[:m.start()] + f'\n{ind}g_set_prgname ("ggbond");\n' + text[m.start():]
-    write(rel, text)
-    log("OK", name, rel + "（插在 gum_init 之后）")
-
-
-# ---------------------------------------------------------------- gum
-# frida-gum 的 gum_init_embedded() 里也有一次 g_set_prgname("frida")，
-# 它会在 gum_init() 时覆盖掉 core 那次，所以必须一起改。
-def patch_gum_prgname():
-    name = "gum pool-frida (prgname)"
-    if not GUM:
-        log("NA", name, "找不到 frida-gum 子项目（只传了 frida-core 根？）")
-        return
-    rel = os.path.join(GUM, "gum", "gum.c")
-    try:
-        with open(rel, "r", encoding="utf-8", newline="") as f:
-            text = f.read()
-    except Exception as e:
-        log("FAIL", name, repr(e))
-        return
-    if 'g_set_prgname ("ggbond")' in text:
-        log("SKIP", name, "已应用")
-        return
-    if 'g_set_prgname ("frida")' not in text:
-        log("FAIL", name, '找不到 g_set_prgname ("frida") 锚点')
-        return
-    with open(rel, "w", encoding="utf-8", newline="") as f:
-        f.write(text.replace('g_set_prgname ("frida")', 'g_set_prgname ("ggbond")'))
-    log("OK", name, rel)
-
-
-# ------------------------------------------------------------------ 0009
-# memfd-name-jit-cache：memfd_create 的 name 参数写死成 "jit-cache"
-def patch_0009():
-    sub_once("lib/base/linux.vala",
-             "Linux.syscall (LinuxSyscall.MEMFD_CREATE, name, flags);",
-             'Linux.syscall (LinuxSyscall.MEMFD_CREATE, "jit-cache", flags);',
-             "0009 memfd-name-jit-cache")
+def patch_0006_thread_names():
+    n = "0006 thread_names"
+    sub_all("lib/agent/agent.vala",
+            '"frida-eternal-agent"',
+            '"%s-agent-worker"' % PREFIX,
+            n, expect=3)
+    sub_all("lib/agent/agent.vala",
+            '"frida-agent-emulated"',
+            '"%s-emulated"' % PREFIX,
+            n)
+    sub_all("src/agent-container.vala",
+            '"frida-agent-container"',
+            '"%s-container"' % PREFIX,
+            n)
 
 
 # ------------------------------------------------------------------ 0010
-# exec anti-anti-frida.py：把 agent 打进资源之后，跑一遍符号清洗
-def patch_0010():
-    rel = "src/embed-agent.py"
-    name = "0010 exec anti-anti-frida.py"
-    if not exists(rel):
-        log("NA", name, f"文件不存在: {rel}")
-        return
-    text = read(rel)
-    if "anti-anti-frida.py" in text:
-        log("SKIP", name, "已应用")
-        return
-    m = re.search(r'([ \t]*)embedded_agent\.write_bytes\(b""\)\n', text)
-    if not m:
-        log("FAIL", name, "找不到 embed 锚点（embedded_agent.write_bytes）")
-        return
-    ind = m.group(1)
-    block = (
-        f'{ind}import os\n'
-        f'{ind}custom_script=str(output_dir)+"/../../../../frida/subprojects/frida-core/src/anti-anti-frida.py"\n'
-        f'{ind}return_code = os.system("python3 "+custom_script+" "+str(priv_dir / f"frida-agent-{{flavor}}.so"))\n'
-        f'{ind}if return_code == 0:\n'
-        f'{ind}    print("anti-anti-frida finished")\n'
-        f'{ind}else:\n'
-        f'{ind}    print("anti-anti-frida error. Code:", return_code)\n'
-    )
-    text = text[:m.end()] + block + text[m.end():]
-    write(rel, text)
-    log("OK", name, rel)
+def patch_0010_linux_entrypoint():
+    """Linux/Android 注入路径：入口符号与 agent 资源名必须跟着改。
+    漏掉 entrypoint 这一处，agent 导出符号已改成 main，而注入端还在找
+    frida_agent_main —— 结果是能连上 server，但一 attach 就失败。"""
+    n = "0010 linux_entrypoint"
+    # 注意：agent 资源名那两处已由 0004 改成随机 UUID，这里只管入口符号。
+    sub_all("src/linux/linux-host-session.vala",
+            '"frida_agent_main"', '"main"', n)
 
 
-STEPS = [
-    patch_0001,
-    patch_0002,
-    patch_0003,
-    patch_0006,
-    patch_gum_prgname,
-    patch_0008,
-    patch_0009,
-    patch_0010,
-]
+# ------------------------------------------------------------------ 0011
+def patch_0011_error_text():
+    """错误文案里的 frida-agent 同样会落进二进制字符串表。"""
+    sub_all("src/host-session-service.vala",
+            "to load frida-agent, ", "to load the agent, ",
+            "0011 error_text")
+
+
+# ------------------------------------------------------------------ 0007
+def patch_0007_prgname():
+    sub_all("src/frida-glue.c",
+            'g_set_prgname ("frida")',
+            'g_set_prgname ("%s")' % PREFIX,
+            "0007 prgname_core")
+
+
+# ------------------------------------------------------------------ 0008 / 0009
+def patch_gum():
+    if GUM is None:
+        log("NA", "0008 prgname_gum", "没找到 frida-gum 子项目")
+        log("NA", "0009 gum_js_loop", "没找到 frida-gum 子项目")
+        return
+    sub_all(os.path.join("gum", "gum.c") if False else "gum/gum.c",
+            'g_set_prgname ("frida")',
+            'g_set_prgname ("%s")' % PREFIX,
+            "0008 prgname_gum", root=GUM)
+    sub_all("bindings/gumjs/gumscriptscheduler.c",
+            '"gum-js-loop"',
+            '"%s-js-loop"' % PREFIX,
+            "0009 gum_js_loop", root=GUM)
+    # gumjs 的 JS runtime 会被打进二进制：frida:rpc 明文在这儿还留着三处。
+    # 不能用 atob —— frida 15.2.2 的 JS 引擎不保证有 atob，改用拼接，
+    # 既保持运行时等价，又让完整明文不再连续出现。
+    rel = "bindings/gumjs/runtime/message-dispatcher.js"
+    if exists(rel, GUM):
+        text = read(rel, GUM)
+        hits = text.count("'frida:rpc'")
+        text = text.replace("'frida:rpc'", "('fr' + 'ida:' + 'rpc')")
+        write(rel, text, GUM)
+        if hits:
+            log("OK", "0012 js_runtime_rpc", "%s x%d" % (rel, hits))
+        elif "('fr' + 'ida:' + 'rpc')" in text:
+            log("SKIP", "0012 js_runtime_rpc", "已应用")
+        else:
+            log("FAIL", "0012 js_runtime_rpc", "未命中: %s" % rel)
+    else:
+        log("NA", "0012 js_runtime_rpc", rel)
 
 
 def main():
-    global ROOT, GUM
     if len(sys.argv) < 2:
-        print("用法: port_patches_to_17233.py <frida 源码根目录 或 frida-core 根目录>")
+        print("用法: python3 port_patches_to_1522.py <frida 源码根>", file=sys.stderr)
         return 0
-    arg = sys.argv[1]
-    if not os.path.isdir(arg):
-        print(f"[FAIL] 目录不存在: {arg}")
-        return 0
-    ROOT, GUM = resolve_roots(arg)
-    print(f"=== Florida 魔改（17.23.3 适配版）坐标 ===")
-    print(f"    frida-core: {ROOT}")
-    print(f"    frida-gum : {GUM}")
-    print(f"=== 开始应用 ===", flush=True)
-    for fn in STEPS:
-        try:
-            fn()
-        except Exception as e:
-            log("FAIL", fn.__name__, repr(e))
+    global ROOT, GUM, TOP
+    ROOT, GUM, TOP = resolve_roots(sys.argv[1])
+    print("super     : %s" % TOP, flush=True)
+    print("frida-core: %s" % ROOT, flush=True)
+    print("frida-gum : %s" % (GUM or "(未找到)"), flush=True)
+    if not os.path.isfile(os.path.join(ROOT, CORE_MARKER)):
+        print("\n[FATAL] 没找到 frida-core（判据: %s）。" % CORE_MARKER, flush=True)
+        print("        当前目录下有: %s" % sorted(os.listdir(sys.argv[1]))[:20], flush=True)
+        print("        请先确认子模块已初始化：git submodule update --init", flush=True)
+
+    patch_0001_rpc()
+    patch_0002_default_dir()
+    patch_0003_linjector()
+    patch_0004_agent_name()
+    patch_0005_agent_main()
+    patch_0006_thread_names()
+    patch_0010_linux_entrypoint()
+    patch_0011_error_text()
+    patch_0007_prgname()
+    patch_gum()
+
     ok = sum(1 for t, _, _ in RESULT if t == "OK")
-    skip = sum(1 for t, _, _ in RESULT if t == "SKIP")
-    fail = sum(1 for t, _, _ in RESULT if t == "FAIL")
-    na = sum(1 for t, _, _ in RESULT if t == "NA")
-    print(f"=== 摘要: OK={ok} SKIP={skip} FAIL={fail} NA(17.x已无此文件)={na} ===", flush=True)
+    warn = sum(1 for t, _, _ in RESULT if t == "WARN")
+    fail = sum(1 for t, _, _ in RESULT if t in ("FAIL", "NA"))
+    print("\n==== 摘要: OK=%d WARN=%d FAIL/NA=%d ====" % (ok, warn, fail), flush=True)
+    for tag, name, detail in RESULT:
+        if tag in ("FAIL", "NA", "WARN"):
+            print("  [%s] %s %s" % (tag, name, detail), flush=True)
+
+    # 2026-10 首次 CI 的教训：脚本全部 NA 时仍然返回 0，于是 CI 继续往下编，
+    # 白白跑 20 分钟产出一个【原版】server（特征一个没改，ggbond 计数为 0）。
+    # 所以默认「严格模式」：只要有一处 FAIL/NA 就返回 1，让 CI 立刻停。
+    # 需要放行时用 FRIDA_PATCH_STRICT=0。
+    if fail > 0 and os.environ.get("FRIDA_PATCH_STRICT", "1") != "0":
+        print("\n[FATAL] 有 %d 处补丁未命中，终止构建。" % fail, flush=True)
+        print("        若确认可以忽略，设 FRIDA_PATCH_STRICT=0 再跑。", flush=True)
+        return 1
     return 0
 
 
