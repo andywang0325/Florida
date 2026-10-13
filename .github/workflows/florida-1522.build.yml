@@ -90,9 +90,12 @@ jobs:
           f=out/frida-server-15.2.2-ggbond-android-arm64
           echo "size: $(stat -c%s "$f") bytes"
           echo "--- 必杀项（必须全为 0 / ggbond 必须 >0）---"
-          for k in ggbond re.frida.server frida_agent_main gum-js-loop frida-helper; do
+          for k in ggbond re.frida.server frida_agent_main gum-js-loop frida-helper-32 frida-helper-64; do
             echo "$k = $(grep -a -o -- "$k" "$f" | wc -l)"
           done
+          # frida-helper（不带 -32/-64）恒 >=6：那是 valac 写进二进制的源文件名
+          # （../../frida-core/src/linux/frida-helper-{types,process,backend,service}.vala），
+          # 只在错误日志里出现，不是进程名，拿它当判据会误杀。
           echo "--- 参考项（非零属正常残留，仅提示）---"
           for k in frida:rpc frida-agent linjector; do
             echo "$k = $(grep -a -o -- "$k" "$f" | wc -l)"
@@ -103,7 +106,8 @@ jobs:
           r=$(grep -a -o re.frida.server "$f" | wc -l)
           m=$(grep -a -o frida_agent_main "$f" | wc -l)
           l=$(grep -a -o gum-js-loop "$f" | wc -l)
-          h=$(grep -a -o frida-helper "$f" | wc -l)
+          h=$(grep -a -o frida-helper-32 "$f" | wc -l)
+          h64=$(grep -a -o frida-helper-64 "$f" | wc -l)
           if [ "$g" -eq 0 ]; then
             echo "::error::补丁未生效（ggbond=0），这是原版构建，请勿使用"
             exit 1
@@ -113,8 +117,8 @@ jobs:
             exit 1
           fi
           # helper 解包文件名 == 进程名：ps 里出现 frida-helper-32 就白改了
-          if [ "$h" -ne 0 ]; then
-            echo "::error::helper 进程名未改（frida-helper=$h），ps 里会暴露"
+          if [ "$h" -ne 0 ] || [ "$h64" -ne 0 ]; then
+            echo "::error::helper 进程名未改（frida-helper-32=$h frida-helper-64=$h64），ps 里会暴露"
             exit 1
           fi
           echo "补丁已生效，可以下载"
