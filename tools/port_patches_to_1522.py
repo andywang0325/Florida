@@ -359,17 +359,27 @@ def patch_gum():
             '"%s-js-loop"' % PREFIX,
             "0009 gum_js_loop", root=GUM)
     # gumjs 的 JS runtime 会被打进二进制：frida:rpc 明文在这儿还留着三处。
-    # 不能用 atob —— frida 15.2.2 的 JS 引擎不保证有 atob，改用拼接，
-    # 既保持运行时等价，又让完整明文不再连续出现。
+    # 不能用 atob —— frida 15.2.2 的 JS 引擎不保证有 atob。
+    # 也不能用 ('fr' + 'ida:' + 'rpc') —— 常量表达式会被 quickjs 折叠回
+    # 完整明文（实测产物里仍剩 2 处完整 'frida:rpc'，多半就是这么来的）。
+    # 改成「函数内对局部变量累加」：涉及变量，不会被常量折叠。
     rel = "bindings/gumjs/runtime/message-dispatcher.js"
+    helper = ("var _rpcTag = function () {\n"
+              "  var s = 'fr';\n"
+              "  s += 'ida:';\n"
+              "  s += 'rpc';\n"
+              "  return s;\n"
+              "};\n")
     if exists(rel, GUM):
         text = read(rel, GUM)
         hits = text.count("'frida:rpc'")
-        text = text.replace("'frida:rpc'", "('fr' + 'ida:' + 'rpc')")
-        write(rel, text, GUM)
         if hits:
-            log("OK", "0012 js_runtime_rpc", "%s x%d" % (rel, hits))
-        elif "('fr' + 'ida:' + 'rpc')" in text:
+            text = text.replace("'frida:rpc'", "_rpcTag()")
+            if "_rpcTag = function" not in text:
+                text = helper + text
+            write(rel, text, GUM)
+            log("OK", "0012 js_runtime_rpc", "%s x%d（含辅助函数）" % (rel, hits))
+        elif "_rpcTag()" in text:
             log("SKIP", "0012 js_runtime_rpc", "已应用")
         else:
             log("FAIL", "0012 js_runtime_rpc", "未命中: %s" % rel)
