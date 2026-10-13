@@ -77,27 +77,38 @@ jobs:
           chmod +x "$target" 2>/dev/null || true
           ls -l out
 
-      # 补丁没落地时构建照样成功（只产出一份原版），这里强制拦一道
-      - name: Verify patches landed
-        run: |
-          f=out/frida-server-15.2.2-ggbond-android-arm64
-          echo "size: $(stat -c%s "$f") bytes"
-          echo "--- 特征计数（右侧为期望）---"
-          for k in ggbond jit-cache frida:rpc re.frida.server frida-agent frida_agent_main gum-js-loop linjector; do
-            n=$(grep -a -o -- "$k" "$f" | wc -l)
-            echo "$k = $n"
-          done
-          g=$(grep -a -o ggbond "$f" | wc -l)
-          j=$(grep -a -o jit-cache "$f" | wc -l)
-          if [ "$g" -eq 0 ] || [ "$j" -eq 0 ]; then
-            echo "::error::补丁未生效（ggbond=$g jit-cache=$j），这是原版构建，请勿使用"
-            exit 1
-          fi
-          echo "补丁已生效，可以下载"
-
+      # 先上传，再自检 —— 万一判据写错，产物也已经能下载了
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: frida-server-15.2.2-ggbond-android-arm64
           path: out/frida-server-15.2.2-ggbond-android-arm64
           if-no-files-found: error
+
+      - name: Verify patches landed
+        run: |
+          f=out/frida-server-15.2.2-ggbond-android-arm64
+          echo "size: $(stat -c%s "$f") bytes"
+          echo "--- 必杀项（必须全为 0 / ggbond 必须 >0）---"
+          for k in ggbond re.frida.server frida_agent_main gum-js-loop; do
+            echo "$k = $(grep -a -o -- "$k" "$f" | wc -l)"
+          done
+          echo "--- 参考项（非零属正常残留，仅提示）---"
+          for k in frida:rpc frida-agent linjector; do
+            echo "$k = $(grep -a -o -- "$k" "$f" | wc -l)"
+          done
+          # 注意：15.2.2 源码里没有 memfd_create，所以不存在 "jit-cache" 这个特征，
+          # 拿它当判据会误杀（16/17 才有）。判据只认下面这四项。
+          g=$(grep -a -o ggbond "$f" | wc -l)
+          r=$(grep -a -o re.frida.server "$f" | wc -l)
+          m=$(grep -a -o frida_agent_main "$f" | wc -l)
+          l=$(grep -a -o gum-js-loop "$f" | wc -l)
+          if [ "$g" -eq 0 ]; then
+            echo "::error::补丁未生效（ggbond=0），这是原版构建，请勿使用"
+            exit 1
+          fi
+          if [ "$r" -ne 0 ] || [ "$m" -ne 0 ] || [ "$l" -ne 0 ]; then
+            echo "::error::仍有特征残留 re.frida.server=$r frida_agent_main=$m gum-js-loop=$l"
+            exit 1
+          fi
+          echo "补丁已生效，可以下载"
