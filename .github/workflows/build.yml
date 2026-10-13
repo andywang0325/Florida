@@ -1,11 +1,16 @@
-# 路线 A 配套 workflow —— 放进 <你的 Florida fork>/.github/workflows/florida-arm64.yml
+# 路线 A · 最终版 workflow
+# 放进 <你的 Florida fork>/.github/workflows/build.yml
 #
-# 与上游 build.yml 的三处关键不同：
+# 与上游 build.yml 的四处关键不同：
 #   1) 只用 workflow_dispatch（无 schedule / 无 push），不会自己跑、不吃配额
 #   2) 只编译 android-arm64（原版编四个架构，6 小时上限里很容易超时）
-#   3) 上传用 actions/upload-artifact@v4，
-#      不用上游那个 actions/upload-release-asset@v1.0.2（Node 12 运行时，已被 GitHub 停用归档，
-#      这正是上游从某个版本起 release 有名字却 assets=0 的直接原因）
+#   3) 上传用 actions/upload-artifact@v4，不用上游那个
+#      actions/upload-release-asset@v1.0.2（Node 12 运行时，已被 GitHub 停用归档，
+#      这正是上游 release 有名字却 assets=0 的直接原因）
+#   4) 魔改补丁不再用 git am —— 上游 patches/ 是 2021 年为 frida-core 15.x 写的，
+#      在 17.23.3 上行号上下文已漂，第一个补丁就 CONFLICT，set -e 会直接搞挂整个 job。
+#      改为跑 tools/port_patches_to_17233.py：基于文本替换，与行号无关、可重复执行，
+#      某一步不匹配就跳过并记进报告，不会中断编译。
 
 name: Build Florida server (arm64)
 
@@ -95,17 +100,10 @@ jobs:
           cd frida
           git checkout "${{ steps.ver.outputs.frida }}"
           git submodule update --init --recursive
-
-          for path in ../patches/*; do
-            name=$(basename "$path")
-            if [ ! -d "subprojects/$name" ]; then
-              echo "跳过 $name（不是 frida 的 subproject）"
-              continue
-            fi
-            echo "=== 应用 patches/$name 到 subprojects/$name ==="
-            ( cd "subprojects/$name" && git am --3way "../../../patches/$name"/*.patch )
-          done
           cd ..
+
+          echo "=== 应用 Florida 魔改（17.23.3 适配版，容错） ==="
+          python3 tools/port_patches_to_17233.py frida
 
           ARCH=android-arm64
           df -h
@@ -132,13 +130,3 @@ jobs:
           name: florida-server-${{ steps.ver.outputs.frida }}-android-arm64
           path: out/*
           retention-days: 30
-
-      # 想直接发到 release 就解开下面这段的注释（配合 Settings -> Actions -> Read and write）
-      # - name: Create release and upload
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     tag_name: ${{ steps.ver.outputs.frida }}
-      #     name: ${{ steps.ver.outputs.frida }}
-      #     files: out/*
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
