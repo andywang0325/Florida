@@ -77,6 +77,24 @@ jobs:
           chmod +x "$target" 2>/dev/null || true
           ls -l out
 
+      # 补丁没落地时构建照样成功（只产出一份原版），这里强制拦一道
+      - name: Verify patches landed
+        run: |
+          f=out/frida-server-15.2.2-ggbond-android-arm64
+          echo "size: $(stat -c%s "$f") bytes"
+          echo "--- 特征计数（右侧为期望）---"
+          for k in ggbond jit-cache frida:rpc re.frida.server frida-agent frida_agent_main gum-js-loop linjector; do
+            n=$(grep -a -o -- "$k" "$f" | wc -l)
+            echo "$k = $n"
+          done
+          g=$(grep -a -o ggbond "$f" | wc -l)
+          j=$(grep -a -o jit-cache "$f" | wc -l)
+          if [ "$g" -eq 0 ] || [ "$j" -eq 0 ]; then
+            echo "::error::补丁未生效（ggbond=$g jit-cache=$j），这是原版构建，请勿使用"
+            exit 1
+          fi
+          echo "补丁已生效，可以下载"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
