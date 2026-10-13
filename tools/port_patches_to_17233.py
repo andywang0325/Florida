@@ -25,8 +25,25 @@ import os
 import re
 import sys
 
-ROOT = None
+ROOT = None   # frida-core 子项目根
+GUM = None    # frida-gum 子项目根
 RESULT = []
+
+
+def resolve_roots(argument):
+    """参数既可以是 frida 超级仓库根，也可以直接是 frida-core 根 —— 自动识别，
+    避免把 ROOT 写错导致「全部 FAIL 却静默产出原版」这种坑。"""
+    core = None
+    for cand in [argument, os.path.join(argument, "subprojects", "frida-core")]:
+        if os.path.isfile(os.path.join(cand, "lib", "base", "rpc.vala")):
+            core = cand
+            break
+    if core is None:
+        core = argument
+    gum = os.path.join(os.path.dirname(os.path.abspath(core)), "frida-gum")
+    if not os.path.isfile(os.path.join(gum, "gum", "gum.c")):
+        gum = None
+    return core, gum
 
 
 def log(tag, name, detail=""):
@@ -274,12 +291,41 @@ def patch_0008():
     if "g_set_prgname" in text:
         log("SKIP", name, "已应用")
         return
-    m = re.search(r"frida_init_with_runtime\s*\([^)]*\)\s*\n\{", text)
+    # 必须插在 gum_init() 之后 —— 因为 frida-gum 的 gum_init_embedded() 里
+    # 自己会 g_set_prgname("frida")，插太早会被它盖掉（gum 那处另行处理）。
+    m = re.search(r"\n([ \t]*)(if \(runtime == FRIDA_RUNTIME_OTHER\))", text)
     if not m:
-        log("FAIL", name, "找不到 frida_init_with_runtime 定义锚点")
+        log("FAIL", name, "找不到 `if (runtime == FRIDA_RUNTIME_OTHER)` 锚点")
         return
-    text = text[:m.end()] + '\n  g_set_prgname ("ggbond");\n' + text[m.end():]
+    ind = m.group(1)
+    text = text[:m.start()] + f'\n{ind}g_set_prgname ("ggbond");\n' + text[m.start():]
     write(rel, text)
+    log("OK", name, rel + "（插在 gum_init 之后）")
+
+
+# ---------------------------------------------------------------- gum
+# frida-gum 的 gum_init_embedded() 里也有一次 g_set_prgname("frida")，
+# 它会在 gum_init() 时覆盖掉 core 那次，所以必须一起改。
+def patch_gum_prgname():
+    name = "gum pool-frida (prgname)"
+    if not GUM:
+        log("NA", name, "找不到 frida-gum 子项目（只传了 frida-core 根？）")
+        return
+    rel = os.path.join(GUM, "gum", "gum.c")
+    try:
+        with open(rel, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+    except Exception as e:
+        log("FAIL", name, repr(e))
+        return
+    if 'g_set_prgname ("ggbond")' in text:
+        log("SKIP", name, "已应用")
+        return
+    if 'g_set_prgname ("frida")' not in text:
+        log("FAIL", name, '找不到 g_set_prgname ("frida") 锚点')
+        return
+    with open(rel, "w", encoding="utf-8", newline="") as f:
+        f.write(text.replace('g_set_prgname ("frida")', 'g_set_prgname ("ggbond")'))
     log("OK", name, rel)
 
 
@@ -328,6 +374,7 @@ STEPS = [
     patch_0002,
     patch_0003,
     patch_0006,
+    patch_gum_prgname,
     patch_0008,
     patch_0009,
     patch_0010,
@@ -335,15 +382,19 @@ STEPS = [
 
 
 def main():
-    global ROOT
+    global ROOT, GUM
     if len(sys.argv) < 2:
-        print("用法: port_patches_to_17233.py <frida 源码根目录>")
+        print("用法: port_patches_to_17233.py <frida 源码根目录 或 frida-core 根目录>")
         return 0
-    ROOT = sys.argv[1]
-    if not os.path.isdir(ROOT):
-        print(f"[FAIL] 目录不存在: {ROOT}")
+    arg = sys.argv[1]
+    if not os.path.isdir(arg):
+        print(f"[FAIL] 目录不存在: {arg}")
         return 0
-    print(f"=== 对 {os.path.abspath(ROOT)} 应用 Florida 魔改（17.23.3 适配版） ===", flush=True)
+    ROOT, GUM = resolve_roots(arg)
+    print(f"=== Florida 魔改（17.23.3 适配版）坐标 ===")
+    print(f"    frida-core: {ROOT}")
+    print(f"    frida-gum : {GUM}")
+    print(f"=== 开始应用 ===", flush=True)
     for fn in STEPS:
         try:
             fn()
