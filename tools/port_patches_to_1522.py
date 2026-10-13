@@ -336,6 +336,43 @@ def patch_0011_error_text():
             "0011 error_text")
 
 
+# ------------------------------------------------------------------ 0013
+def patch_0013_helper_proc():
+    """helper 进程名 —— 实测抓到的最大漏网点。
+
+    linux host session 会把内嵌的 helper 解包成临时文件再 exec：
+        src/linux/frida-helper-process.vala:
+            new TemporaryFile.from_stream ("frida-helper-32", ...)
+    文件名即进程名（临时目录名已随机化，但 basename 没有），于是
+    `ps` 里必然出现 `frida-helper-32`。二进制层面 grep 也确实还剩 8 处
+    frida-helper —— 全部来自这里和构建脚本，运行时一条就够被抓。
+    """
+    n = "0013 helper_procname"
+    sub_all("src/linux/frida-helper-process.vala",
+            '"frida-helper-32"',
+            '"%s-helper-32"' % PREFIX, n)
+    sub_all("src/linux/frida-helper-process.vala",
+            '"frida-helper-64"',
+            '"%s-helper-64"' % PREFIX, n)
+    # droidy（Java 侧 host session）：落盘 dex 名 + abstract socket 名
+    sub_all("src/droidy/droidy-host-session.vala",
+            '"/data/local/tmp/frida-helper-"',
+            '"/data/local/tmp/%s-helper-"' % PREFIX, n)
+    sub_all("src/droidy/droidy-host-session.vala",
+            '"localabstract:/frida-helper-"',
+            '"localabstract:/%s-helper-"' % PREFIX, n)
+    sub_all("src/droidy/helper/re/frida/Helper.java",
+            '"/data/local/tmp/frida-helper-"',
+            '"/data/local/tmp/%s-helper-"' % PREFIX, n)
+    sub_all("src/droidy/helper/re/frida/Helper.java",
+            '"/frida-helper-"',
+            '"/%s-helper-"' % PREFIX, n)
+    # usage 文案也会打进 dex，顺手清掉
+    sub_all("src/droidy/helper/re/frida/Helper.java",
+            '"Usage: frida-helper <instance-id>"',
+            '"Usage: %s-helper <instance-id>"' % PREFIX, n)
+
+
 # ------------------------------------------------------------------ 0007
 def patch_0007_prgname():
     sub_all("src/frida-glue.c",
@@ -409,6 +446,7 @@ def main():
     patch_0006_thread_names()
     patch_0010_linux_entrypoint()
     patch_0011_error_text()
+    patch_0013_helper_proc()
     patch_0007_prgname()
     patch_gum()
 
