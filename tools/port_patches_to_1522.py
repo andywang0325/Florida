@@ -28,6 +28,14 @@ import sys
 
 PREFIX = "ggbond"
 
+# agent 入口符号的新名字。
+# 不能叫 "main"：clang 把 main 当保留入口函数，签名不符是硬错误
+#   error: first parameter of 'main' (argument count) must be of type 'int'
+# 且 -Wmain 关不掉（Florida 之所以能用 main，是因为它压根不在源码层改名，
+# 而是构建后用 lief 改 .so 的符号表 —— 见文件末尾说明）。
+# 用 "agent_main"：编译期完成、不含 frida、也不是魔改版常见的 "main" 特征。
+AGENT_ENTRY = "agent_main"
+
 ROOT = None   # frida-core 子项目根
 GUM = None    # frida-gum 子项目根
 TOP = None    # frida 超级仓库根（Makefile.linux.mk 在这一层）
@@ -268,27 +276,28 @@ def patch_0005_agent_main():
     for rel in ["lib/agent/agent-glue.c",
                 "lib/agent/frida-agent.version",
                 "lib/agent/frida-agent.def"]:
-        sub_all(rel, "frida_agent_main", "main", n, expect=1)
+        sub_all(rel, "frida_agent_main", AGENT_ENTRY, n, expect=1)
     sub_all("src/agent-container.vala",
             'container.module.symbol ("frida_agent_main"',
-            'container.module.symbol ("main"',
+            'container.module.symbol ("%s"' % AGENT_ENTRY,
             n)
     # —— 定义侧（最容易漏，漏了必炸）——
     # 15.2.2 的 agent 入口在 agent.vala 第 2 行写作
     #     namespace Frida.Agent { public void main (...) }
     # C 符号 frida_agent_main 是 valac 按「namespace 前缀 + 方法名」拼出来的，
     # 源码里根本没有这个字面量，grep 不到。改调用方/导出脚本而不改这里，
-    # 链接阶段就是 ld: error: undefined symbol: main。
+    # 链接阶段就是 ld: error: undefined symbol: <新名>。
     # 用 [CCode (cname = ...)] 覆盖 valac 生成的 C 函数名。
+    # 名字必须避开 "main"（clang 会按宿主入口函数校验签名并报 error）。
     sub_all("lib/agent/agent.vala",
             "\tpublic void main (string agent_parameters,",
-            '\t[CCode (cname = "main")]\n'
+            '\t[CCode (cname = "%s")]\n' % AGENT_ENTRY +
             "\tpublic void main (string agent_parameters,",
             n)
     # darwin 分支专用（Android 走不到，但保持一致，避免以后编 macOS 时漏）
     sub_all("lib/agent/meson.build",
             "-Wl,-exported_symbol,_frida_agent_main",
-            "-Wl,-exported_symbol,_main", n)
+            "-Wl,-exported_symbol,_%s" % AGENT_ENTRY, n)
 
 
 # ------------------------------------------------------------------ 0006
@@ -316,7 +325,7 @@ def patch_0010_linux_entrypoint():
     n = "0010 linux_entrypoint"
     # 注意：agent 资源名那两处已由 0004 改成随机 UUID，这里只管入口符号。
     sub_all("src/linux/linux-host-session.vala",
-            '"frida_agent_main"', '"main"', n)
+            '"frida_agent_main"', '"%s"' % AGENT_ENTRY, n)
 
 
 # ------------------------------------------------------------------ 0011
